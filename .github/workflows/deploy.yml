@@ -1,0 +1,90 @@
+# Publish this file as .github/workflows/deploy.yml in the public
+# mindspanorg/apps-deploy repository, alongside mindspan-apps.py from here.
+# Call it from a linked mindspanorg repository by an immutable commit SHA:
+#
+# on:
+#   push:
+#     branches: [main]
+#   workflow_dispatch:
+# permissions:
+#   contents: read
+#   id-token: write
+# jobs:
+#   deploy:
+#     uses: mindspanorg/apps-deploy/.github/workflows/deploy.yml@APPROVED_SHA
+#     with:
+#       app_name: clock
+#       source_path: site
+#       api_url: https://YOUR-API-ORIGIN
+#
+# IT must allow APPROVED_SHA in GITHUB_APPROVED_WORKFLOW_SHAS. The owner stages
+# the repo link first. The first run pins its numeric repo ID, then exits for
+# browser confirmation; rerun this workflow after the owner confirms.
+
+name: Deploy Mindspan app
+
+on:
+  workflow_call:
+    inputs:
+      app_name:
+        description: Reserved app name
+        required: true
+        type: string
+      source_path:
+        description: Relative folder containing index.html
+        required: true
+        type: string
+      api_url:
+        description: HTTPS origin of the Mindspan apps management API
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out caller source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          path: app
+          persist-credentials: false
+      - name: Check out this reusable workflow's pinned tool
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: _mindspan_tool
+          persist-credentials: false
+      - name: Deploy from the linked repository
+        env:
+          MINDSPAN_APPS_API_URL: ${{ inputs.api_url }}
+          MINDSPAN_APPS_SOURCE_ROOT: ${{ github.workspace }}/app
+          MINDSPAN_APP_NAME: ${{ inputs.app_name }}
+          MINDSPAN_SOURCE_PATH: ${{ inputs.source_path }}
+        run: |
+          set +e
+          result=$(python3 "$GITHUB_WORKSPACE/_mindspan_tool/mindspan-apps.py" \
+            github-deploy "$MINDSPAN_APPS_SOURCE_ROOT/$MINDSPAN_SOURCE_PATH" \
+            --name "$MINDSPAN_APP_NAME" --accept-data-rule --json)
+          status=$?
+          set -e
+          printf '%s\n' "$result"
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          printf '%s\n' "$result" | python3 -c '
+          import json, sys
+          lines = [line for line in sys.stdin if line.strip()]
+          body = json.loads(lines[-1]) if lines else {}
+          deploy = body.get("deploy")
+          if (body.get("ok") is not True or body.get("code") != "DEPLOYED"
+                  or not isinstance(deploy, dict) or deploy.get("state") != "succeeded"):
+              print("Deploy did not reach active state; failing the workflow.", file=sys.stderr)
+              sys.exit(1)
+          '
