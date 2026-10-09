@@ -87,21 +87,69 @@ def store_account(client_id):
 
 
 def _mac_store(account, value=None):
-    if value is None:
-        cmd = ["security", "find-generic-password", "-s", SERVICE, "-a", account, "-w"]
-    else:
-        # -w last reads the password from stdin; never put it in argv.
-        cmd = ["security", "add-generic-password", "-s", SERVICE, "-a", account, "-U", "-w"]
+    # `security add-generic-password -w` is not a stdin mode. Framework calls
+    # keep credentials out of argv and avoid cross-process Keychain ACL prompts.
     try:
-        result = subprocess.run(cmd, input=None if value is None else value + "\n",
-                                capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        security = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        find = security.SecKeychainFindGenericPassword
+        find.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
+                         ctypes.c_uint32, ctypes.c_char_p,
+                         ctypes.POINTER(ctypes.c_uint32),
+                         ctypes.POINTER(ctypes.c_void_p),
+                         ctypes.POINTER(ctypes.c_void_p)]
+        find.restype = ctypes.c_int32
+        add = security.SecKeychainAddGenericPassword
+        add.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_char_p,
+                        ctypes.c_uint32, ctypes.c_char_p, ctypes.c_uint32,
+                        ctypes.c_void_p, ctypes.c_void_p]
+        add.restype = ctypes.c_int32
+        update = security.SecKeychainItemModifyAttributesAndData
+        update.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                           ctypes.c_uint32, ctypes.c_void_p]
+        update.restype = ctypes.c_int32
+        release = core_foundation.CFRelease
+        release.argtypes = [ctypes.c_void_p]
+        release.restype = None
+        service = SERVICE.encode("utf-8")
+        user = account.encode("utf-8")
+
+        if value is None:
+            password_length = ctypes.c_uint32()
+            password_data = ctypes.c_void_p()
+            status = find(None, len(service), service, len(user), user,
+                          ctypes.byref(password_length), ctypes.byref(password_data), None)
+            if status == -25300:  # errSecItemNotFound
+                return None
+            if status != 0:
+                raise StoreError("macOS Keychain is unavailable or locked")
+            free_content = security.SecKeychainItemFreeContent
+            free_content.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            free_content.restype = ctypes.c_int32
+            try:
+                return ctypes.string_at(password_data, password_length.value).decode("utf-8") or None
+            finally:
+                free_content(None, password_data)
+
+        secret = value.encode("utf-8")
+        secret_buffer = ctypes.create_string_buffer(secret)
+        item = ctypes.c_void_p()
+        status = find(None, len(service), service, len(user), user,
+                      None, None, ctypes.byref(item))
+        if status == 0:
+            try:
+                status = update(item, None, len(secret), secret_buffer)
+            finally:
+                release(item)
+        elif status == -25300:  # errSecItemNotFound
+            status = add(None, len(service), service, len(user), user,
+                         len(secret), secret_buffer, None)
+        if status != 0:
+            raise StoreError("macOS Keychain is unavailable or locked")
+    except (OSError, AttributeError, ValueError) as exc:
         raise StoreError("macOS Keychain is unavailable or locked") from exc
-    if result.returncode:
-        if value is None and result.returncode == 44:
-            return None
-        raise StoreError("macOS Keychain is unavailable or locked")
-    return result.stdout.strip() if value is None else None
+    return None
 
 
 def _linux_store(account, value=None):
@@ -189,6 +237,14 @@ def client_id():
     return value
 
 
+def client_secret():
+    value = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    if not value:
+        fail("CONFIG_REQUIRED", "GOOGLE_CLIENT_SECRET must name the Mindspan desktop OAuth client secret.",
+             ask_user="Ask IT for the Mindspan apps client configuration.")
+    return value
+
+
 def api_base():
     value = os.environ.get("MINDSPAN_APPS_API_URL", "").strip().rstrip("/")
     try:
@@ -245,6 +301,7 @@ def _json_request(url, *, method="GET", payload=None, headers=None, timeout=20):
 
 
 def _token_request(fields):
+    fields = {**fields, "client_secret": client_secret()}
     request = urllib.request.Request(TOKEN_URL, data=urllib.parse.urlencode(fields).encode(),
                                      method="POST", headers={"Content-Type": "application/x-www-form-urlencoded"})
     try:
@@ -257,10 +314,11 @@ def _token_request(fields):
         if exc.code >= 500:
             fail("API_UNAVAILABLE", "Google sign-in is temporarily unavailable.", retryable=True)
         try:
-            detail = json.load(exc).get("error", "OAuth error")
+            error = json.load(exc)
+            detail = error.get("error_description") or error.get("error", "OAuth error")
         except (ValueError, AttributeError):
             detail = "OAuth error"
-        fail("AUTH_REQUIRED", f"Google sign-in failed: {detail}.",
+        fail("AUTH_REQUIRED", f"Google sign-in failed: {str(detail).rstrip('.')[:300]}.",
              command=tool_command(["login", "--json"]))
     except (urllib.error.URLError, TimeoutError, OSError):
         fail("API_UNAVAILABLE", "Google sign-in could not be reached.", retryable=True)
@@ -367,7 +425,9 @@ def doctor(args):
                   local_shell=True, warp=warp, signed_in=signed_in,
                   sign_in_unverified=signed_in, credential_store=store_state,
                   api_configured=bool(os.environ.get("MINDSPAN_APPS_API_URL")),
-                  google_client_configured=bool(identity), version=VERSION))
+                  google_client_configured=bool(identity),
+                  google_client_secret_configured=bool(os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()),
+                  version=VERSION))
 
 
 def _token_claims(token):
@@ -381,6 +441,7 @@ def _token_claims(token):
 
 def login(args):
     identity = client_id()
+    client_secret()
     # Verify the store exists before presenting an OAuth flow that cannot finish.
     try:
         secure_store(identity)
