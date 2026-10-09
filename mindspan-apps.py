@@ -37,6 +37,9 @@ from pathlib import Path
 VERSION = "0.1.0"
 SELF = str(Path(__file__).resolve())
 SERVICE = "org.mindspan.apps"
+DEFAULT_GOOGLE_CLIENT_ID = "476344853692-fi8170hpm48ojcd83mctvoi6tg4g38ae.apps.googleusercontent.com"
+DEFAULT_API_URL = "https://mindspan-apps-api-hiipmf5dta-uc.a.run.app"
+OAUTH_CONFIG_URL = "https://apps.at.mindspan.org/oauth-client.json"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 USER_ACTION = {"AUTH_REQUIRED", "AUTH_STORE_LOCKED", "CONFIRMATION_REQUIRED",
@@ -230,7 +233,7 @@ def secure_store(client_id, value=None):
 
 
 def client_id():
-    value = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    value = os.environ.get("GOOGLE_CLIENT_ID", DEFAULT_GOOGLE_CLIENT_ID).strip()
     if not value:
         fail("CONFIG_REQUIRED", "GOOGLE_CLIENT_ID must name the Mindspan desktop OAuth client.",
              ask_user="Ask IT for the Mindspan apps client configuration.")
@@ -238,15 +241,32 @@ def client_id():
 
 
 def client_secret():
-    value = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
-    if not value:
-        fail("CONFIG_REQUIRED", "GOOGLE_CLIENT_SECRET must name the Mindspan desktop OAuth client secret.",
-             ask_user="Ask IT for the Mindspan apps client configuration.")
-    return value
+    # Installed-app secrets are shared configuration, not per-user credentials.
+    # Keep this value off the public CLI and fetch it from the WARP-only site.
+    if configured := os.environ.get("GOOGLE_CLIENT_SECRET", "").strip():
+        return configured
+    request = urllib.request.Request(OAUTH_CONFIG_URL, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=15) as response:
+            raw = response.read(16_385)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, OSError):
+        fail("API_UNAVAILABLE", "Could not load Mindspan sign-in configuration. Connect WARP and retry.",
+             retryable=True)
+    if len(raw) > 16_384:
+        fail("API_UNAVAILABLE", "Mindspan sign-in configuration is invalid.", retryable=True)
+    try:
+        body = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        fail("API_UNAVAILABLE", "Mindspan sign-in configuration is invalid.", retryable=True)
+    if (not isinstance(body, dict) or body.get("google_client_id") != client_id()
+            or not isinstance(body.get("google_client_secret"), str)
+            or not body["google_client_secret"]):
+        fail("API_UNAVAILABLE", "Mindspan sign-in configuration is invalid.", retryable=True)
+    return body["google_client_secret"]
 
 
 def api_base():
-    value = os.environ.get("MINDSPAN_APPS_API_URL", "").strip().rstrip("/")
+    value = os.environ.get("MINDSPAN_APPS_API_URL", DEFAULT_API_URL).strip().rstrip("/")
     try:
         parsed = urllib.parse.urlparse(value)
         host, port = parsed.hostname, parsed.port
@@ -408,7 +428,7 @@ def warp_state():
 
 
 def doctor(args):
-    identity = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    identity = client_id()
     warning = []
     try:
         signed_in = bool(secure_store(identity)) if identity else False
@@ -424,9 +444,8 @@ def doctor(args):
                   os=platform.system(), python=platform.python_version(),
                   local_shell=True, warp=warp, signed_in=signed_in,
                   sign_in_unverified=signed_in, credential_store=store_state,
-                  api_configured=bool(os.environ.get("MINDSPAN_APPS_API_URL")),
+                  api_configured=bool(api_base()),
                   google_client_configured=bool(identity),
-                  google_client_secret_configured=bool(os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()),
                   version=VERSION))
 
 
@@ -441,12 +460,12 @@ def _token_claims(token):
 
 def login(args):
     identity = client_id()
-    client_secret()
     # Verify the store exists before presenting an OAuth flow that cannot finish.
     try:
         secure_store(identity)
     except StoreError as exc:
         fail("AUTH_STORE_LOCKED", str(exc), ask_user="Unlock your OS credential store, then retry.")
+    client_secret()  # Fail before opening Google if WARP sign-in configuration is unavailable.
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     state = secrets.token_urlsafe(32)
@@ -529,6 +548,28 @@ class SourceError(Exception):
 
 def _ignored(name):
     return name in {".git", "node_modules", ".venv"} or name.startswith(".env")
+
+
+def buildpack_start_command(folder):
+    """Require an explicit web process before spending a remote build."""
+    if not ((folder / "package.json").is_file() or (folder / "requirements.txt").is_file()):
+        return False
+    procfile = folder / "Procfile"
+    if procfile.is_file() and procfile.stat().st_size <= 16_384:
+        try:
+            if any(line.strip().startswith("web:") and line.split(":", 1)[1].strip()
+                   for line in procfile.read_text(encoding="utf-8").splitlines()):
+                return True
+        except UnicodeError:
+            return False
+    package = folder / "package.json"
+    if package.is_file() and package.stat().st_size <= 1_048_576:
+        try:
+            scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts", {})
+        except (ValueError, UnicodeError, AttributeError):
+            return False
+        return isinstance(scripts, dict) and isinstance(scripts.get("start"), str) and bool(scripts["start"].strip())
+    return False
 
 
 def package_source(folder):
@@ -753,14 +794,16 @@ def deploy(args):
     try:
         archive = package_source(args.path)
         app_type = args.type or archive["detected"]
-        if app_type != "static":
-            fail("NOT_IMPLEMENTED", "Only static index.html deployment is built in this slice.")
-        if not archive["has_index"]:
+        if app_type == "static" and not archive["has_index"]:
             fail("NO_ENTRYPOINT", "Static deployment needs a root index.html.")
+        if app_type == "dockerfile" and not (Path(args.path) / "Dockerfile").is_file():
+            fail("NO_ENTRYPOINT", "Dockerfile deployment needs a root Dockerfile.")
+        if app_type == "buildpack" and not buildpack_start_command(Path(args.path)):
+            fail("NO_START_COMMAND", "Add package.json scripts.start or a root Procfile web: command; build frontend-only projects first and deploy their output folder.")
         init = api_request("POST", name_path(name) + "/deploys", {
             "request_id": deploy_request_id(name, archive, identity),
             "archive_sha256": archive["sha256"],
-            "archive_size": archive["bytes"], "type": "static",
+            "archive_size": archive["bytes"], "type": app_type,
             "accept_data_rule": True,
         }, identity=identity)
         if not init["ok"]:
@@ -951,7 +994,7 @@ def main(argv=None):
     p.add_argument("--name", required=True)
     p.add_argument("--accept-data-rule", action="store_true")
     p.add_argument("--no-wait", action="store_true")
-    p.add_argument("--type", choices=["static"])
+    p.add_argument("--type", choices=["dockerfile", "buildpack", "static"])
     p.set_defaults(run=github_deploy)
     p = sub.add_parser("deploys")
     deploy_sub = p.add_subparsers(dest="deploy_command", required=True)
