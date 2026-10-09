@@ -31,7 +31,7 @@ on:
         required: true
         type: string
       source_path:
-        description: Relative folder containing index.html
+        description: Relative source folder containing index.html, Dockerfile, or an app manifest
         required: true
         type: string
       api_url:
